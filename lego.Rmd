@@ -1,0 +1,26 @@
+---
+title: "Lego Rebbrickable Data Analysis"
+author: "Jakub Fiturski"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    self_contained: yes
+    toc: yes
+    toc_float: yes
+    theme: spacelab
+    number_sections: yes
+    df_print: kable
+---
+ 
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.align = "center")
+set.seed(23)
+```
+
+```{r libraries, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(knitr)
+```
