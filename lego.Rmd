@@ -5,13 +5,14 @@ date: "`r Sys.Date()`"
 output:
   html_document: 
     self_contained: yes
+    keep_md: yes
     toc: yes
     toc_float: yes
     theme: spacelab
     number_sections: yes
     df_print: kable
 ---
- 
+
 ```{r setup, include=FALSE, cache = FALSE}
 knitr::opts_chunk$set(echo = FALSE)
 knitr::opts_chunk$set(fig.align = "center")
@@ -23,4 +24,693 @@ library(dplyr)
 library(ggplot2)
 library(plotly)
 library(knitr)
+library(tidyr)
+library(egg) #ggarrange
+library(gganimate)
+if (!requireNamespace("gifski", quietly = TRUE)) {
+  devtools::install_github("r-rust/gifski")
+}
+library(gifski)
+
+library(caret)
+library(randomForest)
+library(elasticnet)
+
+library(DT)
+prettyTable <- function(table_df, round_digits=2) {
+    DT::datatable(
+      table_df, 
+      style="bootstrap", 
+      filter = "top", 
+      rownames = FALSE, 
+      extensions = "Buttons", 
+      options = list(dom = 'Bfrtip', 
+                     buttons = c('copy', 'csv', 'excel', 'pdf', 'print'))
+      ) %>% formatRound(names(dplyr::select_if(table_df, is.numeric)), round_digits)
+}
+```
+
+# Problem
+
+Raport służy do analizy zmian różnorodności możliwych do zbudowania zestawów LEGO na przestrzeni ostatnich 80 lat.
+
+## Źródło danych
+
+Do analizy wykorzystano zbiór danych udostępniony przez prowadzącego na podstawie danych z [Rebrickable](https://rebrickable.com/) - platformy do dzielenia się, przeglądania i zarządzania swoimi zestawami klocków LEGO. Zbiór zawiera informacje o oficjalnych i MOC'owych zestawach LEGO oraz tworzących go częściach.
+
+## Zbiór danych
+
+Zbiór składa się z 12 plików SCV powiązanych ze sobą w następujacy sposób.
+
+Na potrzeby analizy zostały one połączone w trzy niezależne dataframy przedstawione w kolejnych sekcjach.
+
+![](./data/rebrickable/rebrickable_schema_v3.PNG)
+
+```{r loading-inventory, cache=TRUE}
+# inventory
+data.inventories <- read.csv(
+  file = 'data/rebrickable/inventories.csv', 
+  quote = "\"", comment.char = "", na.strings="?",
+  colClasses = c("integer", "integer", "character")
+)
+
+data.inventories.count <- nrow(data.inventories) # 37265
+
+## inventory set
+data.inventory_sets <- read.csv(
+    file = 'data/rebrickable/inventory_sets.csv', 
+    quote = "\"", comment.char = "", na.strings="?",
+    colClasses = c("integer", "character", "integer")
+  )
+
+data.inventory_sets.count <- nrow(data.inventory_sets) # 4358
+
+# --unused
+data.inventory_sets <- data.inventory_sets %>%
+  right_join(data.inventories, 
+            by = c("inventory_id" = "id"),  
+            suffix = c("", "_inventory")
+  )
+```
+
+### Zestawy
+
+```{r loading-themes, cache=TRUE}
+data.themes <- read.csv(
+  file = 'data/rebrickable/themes.csv', 
+  quote = "\"", comment.char = "", na.strings="?",
+  colClasses = c("integer", "character", "integer")
+)
+
+data.themes <- data.themes %>% 
+  inner_join(data.themes[, c("id", "name")], 
+             by = c("parent_id" = "id"), 
+             suffix = c("", "_parent")
+             ) %>%
+  rename(parent_name = name_parent) %>%
+  select(parent_id, parent_name, id, name)
+
+#prettyTable(data.themes)
+```
+
+```{r loading-sets}
+# po połaczeniu set z inventory_set który ejst znacznie mniejszy, po dofiltrowniau wartosic psutych zbijamy z 21880 do o 4 tys
+# tylke ile ma inventory_set samo w sobie
+
+# sets
+data.sets <- read.csv(
+    file = 'data/rebrickable/sets.csv', 
+    quote = "\"", comment.char = "", na.strings="?",
+    colClasses = c("character", "character", "integer", "integer", "integer")
+  ) %>%
+  left_join(data.inventories,
+            by = c("set_num"="set_num"),
+            suffix = c("_set", ""))
+
+# filter and remove sets without inventory
+data.sets <- data.sets[complete.cases(data.sets),]
+
+# sets + themes
+data.sets <- data.sets %>%
+  left_join(data.themes[, c("id", "name", "parent_name")],
+            by = c("theme_id" = "id"),
+            suffix = c("", "_theme")
+  ) %>%
+  select(set_num, name, year, num_parts, img_url,	name_theme, parent_name, version, id) %>%
+  rename(
+    theme = name_theme,
+    theme_parent = parent_name,
+    inv_set_version = version,
+    inventory_id = id
+  )
+
+# dont filter here, we also want sets without theme :d
+
+knitr::kable(head(select(data.sets, -c('img_url', 'inv_set_version', 'inventory_id'))))
+```
+
+### Minifigurki w zestawach
+
+```{r loading-minifigs, cache=TRUE}
+# ineventory)minifigs - 20858
+# minifigs - 13764
+# oznacza to ze nie kazdy zestaw ma figurke?
+
+data.in_minifigs <- read.csv(
+    file = 'data/rebrickable/inventory_minifigs.csv',
+    quote = "\"", comment.char = "", na.strings="?",
+    colClasses = c("integer", "character", "integer")
+  ) %>%
+  left_join(data.inventories, 
+            by = c("inventory_id" = "id"),  
+            suffix = c("_minifigs", "_inventory")
+  )
+
+data.minifigs <- read.csv(
+  file = 'data/rebrickable/minifigs.csv',
+  quote = "\"", comment.char = "", na.strings="?",
+  colClasses = c("character", "character", "integer")
+)
+data.minifigs.count <- nrow(data.minifigs)
+
+data.in_minifigs <- data.in_minifigs %>%
+  left_join(data.minifigs, 
+            by = c("fig_num" = "fig_num"),  
+            suffix = c("_in_minifigs", "_minifigs")
+            ) %>%
+  select(name, fig_num, num_parts, img_url, quantity, set_num, version, inventory_id) %>%
+  rename(
+    inv_set_num = set_num,
+    inv_set_version = version
+  )
+
+# dont filter here, we also want minifigs without colour :d
+data.in_minifigs <- data.in_minifigs[complete.cases(data.in_minifigs),]
+#knitr::kable(length(data.in_minifigs$fig_num)) # - 20858
+#knitr::kable(length(unique(data.in_minifigs$fig_num))) # - 13455 unikalnych figurek - zgodne z wielkoscia23: minifigs 13764
+
+knitr::kable(head(select(data.in_minifigs, -c('img_url', 'inv_set_version', 'inventory_id'))))
+```
+
+### Części w zestawach
+```{r loading-colors, cache=TRUE}
+data.colors <- read.csv(
+  file='data/rebrickable/colors.csv',
+  quote = "\"", comment.char = "", na.strings = "?",
+  colClasses = c("integer", "character", "character", "character")
+)
+```
+
+```{r loading-parts, cache=TRUE}
+data.parts_cat <- read.csv(
+  file='data/rebrickable/part_categories.csv',
+  quote = "\"", comment.char = "", na.strings = "?",
+  colClasses = c("integer", "character")
+)
+
+data.parts <- read.csv(
+  file='data/rebrickable/parts.csv',
+  quote = "\"", comment.char = "", na.strings = "?",
+  colClasses = c("character", "character", "integer")
+)%>%
+  left_join(data.parts_cat, 
+            by = c("part_cat_id" = "id"),  
+            suffix = c("_categories", "_parts")
+            ) %>%
+  select(part_num, name_parts, name_categories, part_material) %>%
+  rename(
+    part_name = name_parts,
+    category_name = name_categories
+  )
+
+data.parts.count <- nrow(data.parts) # 52615
+```
+
+```{r inventory-parts, cache=TRUE}
+
+data.in_parts <- read.csv(
+  file = 'data/rebrickable/inventory_parts.csv', 
+  quote = "\"", comment.char = "", na.strings = "?",
+  colClasses = c("integer", "character", "integer", "integer", "character", "character")
+) %>%
+  left_join(data.inventories, by = c("inventory_id" = "id")) %>%
+  left_join(data.parts, by = c("part_num")) %>%
+  left_join(data.colors, by = c("color_id" = "id")) %>%
+  select(part_num, part_name,	category_name, part_material, is_spare, name, rgb, is_trans, img_url, quantity, set_num, version, inventory_id) %>%
+  rename(
+    color_name = name,
+    color_rgb = rgb,
+    color_is_trans = is_trans,
+    inv_set_num = set_num,
+    inv_set_version = version
+  ) %>%
+    mutate(is_spare = ifelse(is_spare == "f", 0, 1)) %>%
+    mutate(color_is_trans = ifelse(color_is_trans == "f", 1, 0))
+
+data.in_parts.count <- nrow(data.in_parts) # 1180987
+
+
+knitr::kable(head(select(data.in_parts, -c('img_url', 'inv_set_version', 'inventory_id'))))
+```
+
+
+## Podsumowanie danych
+
+### Zestawy
+
+```{r summary-sets}
+knitr::kable(summary(select(data.sets, -c('img_url', 'inv_set_version', 'inventory_id'))))
+```
+
+### Minifigurki
+
+```{r summary-minifigs}
+knitr::kable(summary(select(data.in_minifigs, -c('img_url', 'inv_set_version', 'inventory_id'))))
+```
+
+### Klocki
+
+```{r summary-parts}
+knitr::kable(summary(data.in_parts[, 1:7]))
+knitr::kable(summary(select(data.in_parts[, 8:13], -c('img_url', 'inv_set_version', 'inventory_id'))))
+
+```
+
+
+# Analiza
+
+## Podstawowa analiza
+
+### Liczebność zestawów
+
+```{r analysis-set-amount, warning=FALSE, cache=TRUE}
+# 1. agreguj lata w przedziały po 5 (zmniejszy to ilość wartości na osiach)
+# 2. policz zestawy w tych przedziałach
+# 3. przedstaw na wykresie
+data.sets %>% select(year) %>%
+  mutate(decade_start = 5 * (year %/% 5), 
+         decade_end = decade_start + 5,
+         decade = paste0("<", decade_start, ", ", decade_end, ")")
+  ) %>%
+  group_by(decade) %>%
+  summarize('count' = n()) %>% 
+  ggplot(aes(x=decade)) +
+    geom_col(aes(y=count), fill='lightblue', color=alpha('darkblue', 0.1)) + 
+    geom_density(color=alpha('black', 0.6)) + 
+    labs(x='', y='Liczba zestawów', title='Rozkład liczby zestawów w poszczególnych latach') +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+Wykres prezentuje liczbę zestawów powstałych w kolejnych latach.
+
+Widzimy na nim że w latach `1945-1995` były to niewielkie ilości.
+Natomiast od roku `2000` nastąpił intensywny przyrost dodawanych zestawów LEGO który cały utrzymuje się do dziś.
+
+### Liczba klocków w zestawach
+
+```{r analysis-sets-parts, warning=FALSE, fig.height=3, cache=TRUE}
+data.in_parts.grup <- data.in_parts %>%
+  group_by(inventory_id) %>%
+  summarise('num_parts' = n())
+
+data.in_parts.grup.count <- nrow(data.in_parts.grup)
+
+data.in_parts.grup %>%
+  ggplot(aes(x = num_parts, y = as.numeric(row.names(data.in_parts.grup)))) +
+    geom_point(fill='lightblue', color=alpha('darkblue', 0.1)) +
+    ylab("") + xlab("Ilość części") +
+  theme_minimal() + 
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+```{r dd, fig.height=5, warning=FALSE, cache=TRUE}
+data.in_parts.grup %>% 
+  group_by(num_parts) %>%
+  summarize('count' = n()) %>% filter(count >= 100) %>%
+  ggplot(aes(y = factor(num_parts))) +
+    geom_col(aes(x = count), fill='lightblue', color=alpha('darkblue', 0.1)) + 
+    geom_density(color=alpha('black', 0.6)) + 
+  labs(title = "Gęstość ilości klocków", x = "Liczba Wystąpień", y = "Ilość części") +
+  theme_minimal() + 
+  theme(axis.text.y = element_text(margin = margin(t = 10, b = 10), size=8))
+```
+
+Zbiór klocków tworzy `r data.in_parts.grup.count` różnych zestawów.
+
+Pierwszy wykres reprezentuje rozproszenie zestawów o określonej ilości elementów. Na wykresie widać, że większość zestawów nie przekracza zawartości 250 klocków.
+
+Drugi wykres przedstawia rozkład **gęstości** zestawów o zadanej liczbie elementów. Ze względu na dużą ilość potencjalnych wartości dane zostały zawężone do zestawów których ilość klocków wystąpiła conajmniej 100 razy.
+
+**Wnioski**
+Na wykresie widać że najczęściej występują małe zestawy, nieprzekraczające 15 klocków.
+
+### Liczba minifigurek w zestawach
+
+```{r analysis-sets-minifigs, warning=FALSE, fig.height=5, fig.align="default", fig.asp=0.618, out.width="50%", cache=TRUE}
+data.in_minifigs.group <- data.in_minifigs %>%
+  group_by(inventory_id) %>%
+  summarise('num_parts' = n())
+
+data.in_minifigs.group %>%
+  ggplot(aes(x = num_parts, y = as.numeric(row.names(data.in_minifigs.group)))) +
+    geom_point(fill='lightblue', color=alpha('darkblue', 0.1)) +
+    ylab("") + xlab("Ilość figurek") +
+  theme_minimal() + 
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+data.in_minifigs.group %>% 
+  group_by(num_parts) %>%
+  summarize('count' = n()) %>%
+  ggplot(aes(y = factor(num_parts))) +
+    geom_col(aes(x = count), fill='lightblue', color=alpha('darkblue', 0.1)) + 
+    geom_density(color=alpha('black', 0.6)) + 
+  labs(title = "Gęstość ilości figurek", x = "Liczba Wystąpień", y = "Ilość figurek") +
+  theme_minimal() + 
+  theme(axis.text.y = element_text(margin = margin(t = 10, b = 10), size=8))
+```
+
+Pierwszy wykres reprezentuje rozproszenie zestawów o określonej ilości minifigurek Na wykresie widać, że większość zestawów nie zawiera więcej niż 8 fugurek.
+
+Drugi wykres przedstawia rozkład **gęstości** zestawów o zadanej liczbie minifigurek.
+Wyraźnie widać że dominują zestawy z `jedną` figurką. Natomiast duża ich część zawiera nawet do `czterech` minifigur. 
+
+### Liczba części w minifigurkach
+
+```{r analysis-minifig-parts, warning=FALSE, fig.height=5, fig.align="default", fig.asp=0.618, out.width="50%", cache=TRUE}
+data.minifigs %>%
+  ggplot(aes(x = num_parts, y = as.numeric(row.names(data.minifigs)))) +
+    geom_point(fill='lightblue', color=alpha('darkblue', 0.1)) +
+    ylab("") + xlab("Ilość części") +
+  theme_minimal() + 
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+data.minifigs %>% 
+  group_by(num_parts) %>%
+  summarize('count' = n()) %>% filter(num_parts <= 20) %>%
+  ggplot(aes(y = factor(num_parts))) +
+    geom_col(aes(x = count), fill='lightblue', color=alpha('darkblue', 0.1)) + 
+    geom_density(color=alpha('black', 0.6)) + 
+  labs(title = "Gęstość ilości klocków", x = "Liczba Wystąpień", y = "Ilość części") +
+  theme_minimal() + 
+  theme(axis.text.y = element_text(margin = margin(t = 10, b = 10), size=8))
+```
+
+Zbiór figurek składa się z `r data.minifigs.count` rekordów.
+
+Po lewej stronie widzimy rozproszenie minifigurek o określonej ilości elementów. Na wykresie zaobserwować można, że zdecydowana większość skupia się na początku osi X - w skład figurki wchodzi mniej niż 10 części. Za outlayerów można uznać rekordy przekraczajace tą wartość.
+
+Na wykresie po prawej stronie możemy dokładniej przyjrzeć się rozkładowi **gęstość** ilości część składających się na figurki.
+Wyraźnie widać że dominują minifigurki `czteroelementowe`. Za nimi drugą wielkość stanowią `pięcioelementowe`.
+
+### Materiały
+
+```{r analysis-materials, warning=FALSE, fig.height = 4, cache=TRUE}
+data.parts  %>%
+  group_by(part_material) %>%
+  summarize('count' = n()) %>%
+  ggplot(aes(x = factor(part_material), y = factor(part_material), fill = count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label=count)) +
+    scale_fill_gradient(low = "blue", high = "red") +
+  theme_minimal() + xlab("") + ylab("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Wartość użytego materiału do produkcji klocków nie rozkłada się w żaden sposób. Wyrażnie widać że czynnikiem dominującym w produkcji jest `plastik`.
+
+
+### Kolory
+
+```{r analysis-colors, warning=FALSE, fig.align="default", fig.asp=0.618, out.width="50%", cache=TRUE}
+data.parts.clear <- data.parts %>% filter(!is.na(color_name))
+
+w <- data.parts.clear %>% 
+    select(color_name) %>%
+    group_by(color_name) %>%
+    summarize('count' = n()) %>%
+    arrange(desc(count))
+
+unique_colors =  unique(w$color_name)
+color_batches <- split(unique_colors, ceiling(seq_along(unique_colors) / 19))
+
+
+for (i in seq_along(color_batches)) {
+    p <- w %>% filter(color_name %in% color_batches[[i]]) %>%
+      ggplot(aes(x = factor(color_name))) +
+        geom_col(aes(y = count), fill='lightblue', color=alpha('darkblue', 0.1)) + 
+        geom_density(color=alpha('black', 0.6)) + 
+      labs(title = "", x = "", y = "") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size=10))
+
+    print(p)
+}
+```
+
+W klockach LEGO zdefiniowano `r length(unique_colors)` kolorów.
+Większość klocków produkowana jest w kolorze `czarnym` i `białym`. W klockach dominuje jednak spora różnorodność kolorystyczna.
+
+
+## Szczegółowa analiza atrybutów
+
+### Tematy
+```{r analysis-sets-themes-reduce, cache=TRUE}
+data.sets.count <- nrow(data.sets)
+data.sets_themes <- data.sets %>% select(set_num, name, year, num_parts, theme, theme_parent)
+data.sets_themes <- data.sets_themes %>% 
+                      filter(!is.na(theme)) %>%
+                      mutate(theme_parent = coalesce(theme_parent, theme))
+
+data.sets.reduced.count <- nrow(data.sets_themes)
+```
+
+W zbiorze zestawów pojawiają się braki w wartościach kolumn: `theme`, `parent_theme`.
+
+Z uwagi na to musimy je odfiltorwać, redukując ilość danych z `r data.sets.count` do `r data.sets.reduced.count` (`r round(data.sets.reduced.count/data.sets.count*100)`% danych jest pełnych). 
+
+```{r analysis-sets-themes, cache=TRUE, fig.width=10}
+p <- data.sets_themes %>%
+  ggplot(
+    aes(x = theme_parent)
+    ) +
+  geom_bar(fill='lightblue', color=alpha('darkblue', 0.1), position = "dodge") + 
+  labs(title = "Rok: {frame_time}", x="Temat", y="Liczba zestawów") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  transition_time(year)
+
+animate(p, fps=4, height = 5, width = 10, units = "in", res=110)
+```
+
+Na animacji możemy zaobserwować, że w latach 1950-1970 dominowały zestawy o tematyce `System` a od roku 2000 nieprzerwanie zdecydowaną większość stanowią zestawy `Gear`.
+
+### Rozkład klocków według motywów
+```{r analysis-theme-num-part, warning=FALSE, message=FALSE, cache=TRUE}
+data.sets.theme_agg <- data.sets_themes %>% 
+  group_by(year, theme_parent) %>%
+  summarize(
+    mean_num_part = mean(num_parts)
+  )
+
+data.sets.theme_agg.p1 <- data.sets.theme_agg %>%
+  ggplot(aes(x = factor(theme_parent), y = mean_num_part)) +
+    geom_col(fill='lightblue', color=alpha('darkblue', 0.1)) + 
+    labs(title = "Średnia ilość w roku: {frame_time}", y = "Średnia ilość klocków", x="Temat") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  transition_time(year)
+
+data.sets.theme_agg.p2 <- data.sets.theme_agg %>%
+  ggplot(aes(y=mean_num_part)) +
+    geom_boxplot() + 
+    coord_flip() + 
+    labs() +
+    theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+    ) +
+  transition_time(year)
+```
+
+```{r analysis-theme-num-part-i, fig.width=10}
+animate(data.sets.theme_agg.p1, fps=4, height = 5, width = 10, units = "in", res=110)
+```
+
+Mimo, że poprzednia sekcja wskazała na `system` oraz `gear` jako najczęściej występujce tematycznie zestawy to powyższy wykres nie wskazuje aby dominowały pod względem ilości klocków.
+
+Najbardziej wyróżnia się tematyka `Star Wars` która od `2015` dominuje pod względem liczebności klocków budujących zestawy.
+
+**Wnioski**
+Popularność zestawów nie idzie w parze z ich wielkością.
+
+```{r analysis-theme-num-part-ii, fig.width=10}
+animate(data.sets.theme_agg.p2, fps=4, height = 1, width = 9, units = "in", res=110)
+```
+
+Dodatkowo powyższy boxplot cały czas przesunięty jest znacznie w stronę 0.
+Spowodowane jest to pewną rzadkością w liczebności elementów w motywach. Wynikać to może najpewniej z sezonowości tematów jakie są wypuszczane przez firmę i okresowym zainteresowaniem nimi przez ludzi. 
+
+Motywy klocków w dużej części związane są z popularnymi książkami, filmami czy serialami. Wzrosty tematów na wykresach pokrywają sie w natrualny sposob czasowo z datami nowych premier. Wynika stąd, że klocki LEGO podążają za trendami kulturowymi.
+
+### Rozkład klocków według kolorów
+
+```{r load-set-part, warning=FALSE, message=FALSE, cache=TRUE}
+data.sets_parts <- data.in_parts %>%
+  left_join(data.sets, by = c("inventory_id")) %>%
+  select(part_name, category_name, part_material, is_spare, color_name, color_rgb, color_is_trans, inventory_id, name, year, theme, theme_parent) %>%
+   mutate(decade_start = 5 * (year %/% 5), 
+         decade_end = decade_start + 5,
+         decade = paste0("<", decade_start, ", ", decade_end, ")")
+  )
+```
+
+```{r analysis-color-num-part, warning=FALSE, message=FALSE, cache=TRUE}
+data.parts.color_agg <- data.sets_parts %>% 
+  group_by(year, color_name) %>%
+  summarize(
+    'count' = n()
+  )
+
+data.parts.color_agg.p1 <- data.parts.color_agg %>%
+  filter(count >= 200) %>%
+  ggplot(aes(x = factor(color_name), y = count)) +
+    geom_col(fill='lightblue', color=alpha('darkblue', 0.1)) + 
+    labs(title = "Ilość w roku: {frame_time}", y = "Średnia ilość klocków", x="Kolor") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  transition_time(year)
+```
+
+```{r analysis-color-num-part-i, fig.width=10}
+animate(data.parts.color_agg.p1, fps=4, height = 5, width = 10, units = "in", res=110)
+```
+
+Animacja pokazuje, rozkład kolorów wśród produkowanych klocków w poszczególnych latach. Ze względu na dużą ilość dostępnych kolorów (`r length(unique_colors)` kolorów) zostały wybrane tylko te powyżej 200 klocków.
+
+Widać, że od roku `2000` nastąpił znaczący wzrost używanych kolorów co pokrywa się ze wzrostem liczby produkowanych zestawów z sekcji '*Liczebność zestawów*'.
+
+### Analiza korelacji między zmiennymi
+
+Poniżej znajduje się tabela zawierające współczynniki korelacji pearsona dla zestawów i tworzących je klocków.
+
+```{r correlation_table}
+correlations = data.sets_parts %>%
+  select(-c(part_name, name, year, decade_start, decade_end)) %>%
+  filter(!is.na(theme)) %>%
+  mutate(
+    across(c(category_name, 
+             part_material, 
+             is_spare, 
+             color_name, 
+             color_rgb, 
+             color_is_trans, 
+             inventory_id, 
+             theme, 
+             theme_parent,
+             decade),
+           ~ as.numeric(factor(.))
+           )) %>%
+  cor() %>%
+  round(digits=2)
+
+knitr::kable(correlations)
+```
+
+Na podstawie danych trudno dojrzeć silniejsze związki (z wartością współczynnika korelacji pearsona powyżej 0.5, bądź poniżej -0.5) pomiędzy którymikolwiek nieoczywistymi wartościami. 
+
+Widoczna jest jedynie zależność:
+
+- **`color_name`** oraz **`color_rgb`**: *`r correlations['color_rgb', 'color_name']`*
+
+# Predykcja produkcji klocka
+
+W naszej analizie przygotujemy 4 modele do przewidywania dekady produkcji klocka, na tych samych danych.
+
+## Dane
+```{r prepare_data, cache=TRUE}
+
+data.sets_parts <- data.sets_parts %>%
+  select(-c(inventory_id, part_name, name, year, decade_end, decade)) %>%
+  filter(!is.na(theme)) %>%
+  mutate(
+    across(c(category_name, 
+             part_material, 
+             is_spare, 
+             color_name, 
+             color_rgb, 
+             color_is_trans, 
+             theme, 
+             theme_parent,
+             decade_start),
+           ~ as.numeric(factor(.))
+           ))
+
+trainingIndex <- createDataPartition(y=data.sets_parts$decade_start, p=0.75, list = FALSE)
+
+data <- data.sets_parts 
+
+training <- data[trainingIndex,]
+testing <- data[-trainingIndex,]
+ctrl <- trainControl(method="repeatedcv", number=2, repeats=5)
+```
+
+Dane do uczenia dzielimy na 3 zbiory:
+
+- treningowy - na którym odbędzie się uczenie (75% całego zbioru danych)
+- testowy - na którym będzie sprawdzana wydajność modelu (25% całego zbioru danych)
+- kontrolny - określony poprzez powtórną krosswalidacje
+
+
+## Linear Regression
+```{r model_lm, cache=TRUE}
+grid <- expand.grid(intercept = c(TRUE, FALSE))
+
+lm_fit <- train(decade_start ~ ., data=training, method='lm', metric='RMSE', trControl=ctrl, preProc=c('center', 'scale'), tuneGrid = grid, na.action=na.omit)
+lm_fit
+```
+
+```{r model_lm_variabvles}
+ggplotly(ggplot(varImp(lm_fit)))
+```
+
+
+## RIDGE
+```{r model_ridge, cache=TRUE}
+grid <- expand.grid(lambda = seq(0, 5, length=20))
+
+ridge_fit <- train(decade_start ~ ., data=training, method='ridge', metric='RMSE', trControl=ctrl, preProc=c('center', 'scale'), tuneGrid = grid)
+ridge_fit
+```
+
+```{r model_ridge_visualisation}
+ggplotly(ggplot(ridge_fit))
+```
+
+```{r model_ridge_variabvles}
+ggplotly(ggplot(varImp(ridge_fit)))
+```
+
+## LASSO
+```{r model_lasso, cache=TRUE, warning=FALSE}
+grid <- expand.grid(fraction = seq(0, 1, length=20))
+lasso_fit <- train(decade_start ~ ., data=training, method='lasso', metric='RMSE', trControl=ctrl, preProc=c('center', 'scale'), tuneGrid = grid)
+lasso_fit
+```
+
+```{r model_lasso_visualisation}
+ggplotly(ggplot(lasso_fit))
+```
+
+```{r model_lasso_variabvles}
+ggplotly(ggplot(varImp(lasso_fit)))
+```
+
+
+## Porównanie
+
+```{r model_summary}
+models <- resamples(list(lm = lm_fit, ridge = ridge_fit, lasso=lasso_fit))
+summary(models)
+```
+
+```{r lm_summary}
+# Regresja liniowa:
+
+#kable(postResample(predict(lm_fit, newdata=testing), testing$decade_start))
+```
+
+```{r ridge_summary}
+# RIDGE:
+
+#kable(postResample(predict(ridge_fit, newdata=testing), testing$decade_start))
+```
+
+```{r lasso_summary}
+# LASSO:
+
+#kable(postResample(predict(lasso_fit, newdata=testing), testing$decade_start))
 ```
